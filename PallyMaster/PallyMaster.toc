@@ -2,7 +2,7 @@
 ## Title: PallyMaster
 ## Notes: Ауры паладинов и назначение баффов в одном аддоне
 ## Author: Nikol
-## Version: 1.0.0
+## Version: 1.0.1
 ## SavedVariables: PallyMasterDB
 
 Libs\LibStub\LibStub.lua

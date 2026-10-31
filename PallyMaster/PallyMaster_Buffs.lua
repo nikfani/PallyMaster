@@ -142,15 +142,17 @@ local function ScanSpellbookForSpec()
     return nil
 end
 
+-- Только спеко-эксклюзивные способности/таланты: по ним можно понять спек
+-- по аурам. Обычные заклинания паладина (Праведный гнев есть у всех) сюда
+-- попадать не должны — иначе спек «прыгает».
 local SPEC_SPELL_NAMES = {
-    ["Righteous Fury"] = "Protection", ["Holy Shield"] = "Protection",
+    ["Holy Shield"] = "Protection",
     ["Avenger's Shield"] = "Protection", ["Shield of Righteousness"] = "Protection",
     ["Hammer of the Righteous"] = "Protection",
     ["Holy Shock"] = "Holy", ["Beacon of Light"] = "Holy", ["Light's Grace"] = "Holy",
     ["Crusader Strike"] = "Retribution", ["Divine Storm"] = "Retribution",
     ["Repentance"] = "Retribution", ["Seal of Command"] = "Retribution",
 }
-SPEC_SPELL_NAMES["Праведный гнев"] = "Protection"
 SPEC_SPELL_NAMES["Святой щит"] = "Protection"
 SPEC_SPELL_NAMES["Щит правосудия"] = "Protection"
 SPEC_SPELL_NAMES["Молот праведности"] = "Protection"
@@ -196,14 +198,28 @@ local function GetSpecFromLib(unit)
     return SpecFromLibName(tree)
 end
 
+-- Возвращает спек и источник данных:
+--   talent    — инспект талантов (самый надёжный),
+--   spellbook — книга заклинаний (только игрок),
+--   lib       — LibGroupTalents,
+--   aura      — эвристика по аурам.
 local function GetSpecForUnit(unit)
     if unit == "player" then
-        return ScanSpellbookForSpec()
-            or GetPlayerSpecViaTalents()
-            or GetSpecFromLib(unit)
-            or ScanUnitForSpecAuras(unit)
+        local spec = ScanSpellbookForSpec()
+        if spec then return spec, "spellbook" end
+        spec = GetPlayerSpecViaTalents()
+        if spec then return spec, "talent" end
+        spec = GetSpecFromLib(unit)
+        if spec then return spec, "lib" end
+        spec = ScanUnitForSpecAuras(unit)
+        if spec then return spec, "aura" end
+        return nil
     end
-    return GetSpecFromLib(unit) or ScanUnitForSpecAuras(unit)
+    local spec = GetSpecFromLib(unit)
+    if spec then return spec, "lib" end
+    spec = ScanUnitForSpecAuras(unit)
+    if spec then return spec, "aura" end
+    return nil
 end
 
 -- ==================== SETTINGS ====================
@@ -261,41 +277,83 @@ local function IsInspectable(unit)
 end
 
 -- ==================== SPEC CACHE ====================
-local function CacheSpec(unit, spec)
+-- В кэше храним не только спек, но и источник: значение из инспекта
+-- не должно перетираться догадкой по аурам.
+local function CacheSpec(unit, spec, source)
     if not spec then return end
     local guid = UnitGUID(unit)
-    if guid then B.specCache[guid] = spec end
+    if guid then B.specCache[guid] = { spec = spec, source = source } end
 end
 
 local function GetCachedSpec(unit)
     local guid = UnitGUID(unit)
-    return guid and B.specCache[guid] or nil
+    local entry = guid and B.specCache[guid]
+    if type(entry) == "table" then return entry.spec, entry.source end
+    return entry, nil
 end
 
 -- ==================== ROSTER ====================
-local function ApplySpec(name, spec)
+-- Насколько источнику можно доверять. Спек, полученный из талантов или книги
+-- заклинаний, не должен затираться догадкой по аурам — иначе полоски мигают.
+local SPEC_WEIGHT = { talent = 3, spellbook = 3, lib = 2, aura = 1 }
+
+-- Единая точка изменения спека. Возвращает true, если спек реально изменился.
+function B:SetSpec(name, spec, source)
     if not spec then return false end
     local p = B.paladins[name]
     if not p then return false end
+
+    source = source or "aura"
+    local w = SPEC_WEIGHT[source] or 1
+    local oldW = SPEC_WEIGHT[p.specSource or ""] or 0
+
+    if p.spec == spec then
+        p.pendingSpec, p.pendingCount = nil, 0
+        if w > oldW then p.specSource = source end
+        return false
+    end
+
+    -- источник слабее уже известного — не трогаем спек
+    if p.spec and w < oldW then return false end
+
+    -- Источник того же уровня: смену принимаем только после двух подряд
+    -- одинаковых показаний, чтобы эвристика не дёргала полоску. Данные
+    -- инспекта и книги заклинаний авторитетны — применяем сразу.
+    if p.spec and w == oldW and w < 3 then
+        if p.pendingSpec == spec then
+            p.pendingCount = (p.pendingCount or 0) + 1
+        else
+            p.pendingSpec, p.pendingCount = spec, 1
+        end
+        if (p.pendingCount or 0) < 2 then return false end
+    end
+    p.pendingSpec, p.pendingCount = nil, 0
+
     local changed = (p.spec ~= spec)
     p.spec = spec
-    CacheSpec(p.unit, spec)
+    p.specSource = source
+    CacheSpec(p.unit, spec, source)
 
-    if spec ~= "Protection" then
-        if B.assignments["proto"] == name then
-            B.assignments["proto"] = nil
-            p.buffs["proto"] = nil
+    -- Назначение «Прото» меняем только по надёжным данным (инспект, книга,
+    -- библиотека): догадка по аурам не должна снимать назначение.
+    if w >= 2 then
+        p.buffs = p.buffs or {}
+        if spec ~= "Protection" then
+            if B.assignments["proto"] == name then
+                B.assignments["proto"] = nil
+                p.buffs["proto"] = nil
+                changed = true
+            end
+            if B.db and B.db.assignments and B.db.assignments["proto"] == name then
+                B.db.assignments["proto"] = nil
+                changed = true
+            end
+        elseif not B.assignments["proto"]
+            and B.db and B.db.assignments and B.db.assignments["proto"] == name then
+            p.buffs["proto"] = true
+            B.assignments["proto"] = name
             changed = true
         end
-        if B.db and B.db.assignments and B.db.assignments["proto"] == name then
-            B.db.assignments["proto"] = nil
-            changed = true
-        end
-    elseif not B.assignments["proto"]
-        and B.db and B.db.assignments and B.db.assignments["proto"] == name then
-        p.buffs["proto"] = true
-        B.assignments["proto"] = name
-        changed = true
     end
     return changed
 end
@@ -327,17 +385,23 @@ function B:UpdateRoster()
         if name then
             seen[name] = true
             local existing = B.paladins[name]
-            local spec = GetSpecForUnit(unit)
-                or (existing and existing.spec)
-                or GetCachedSpec(unit)
-
             if not existing then
-                B.paladins[name] = { unit = unit, spec = spec, buffs = {} }
+                existing = { unit = unit, buffs = {} }
+                B.paladins[name] = existing
             else
                 existing.unit = unit
-                if spec then existing.spec = spec end
             end
-            if spec then CacheSpec(unit, spec) end
+
+            local spec, source = GetSpecForUnit(unit)
+            if not spec then
+                spec, source = GetCachedSpec(unit)
+            end
+            if spec then
+                B:SetSpec(name, spec, source)
+            end
+            if existing.spec then
+                CacheSpec(unit, existing.spec, existing.specSource)
+            end
         end
     end
 
@@ -398,7 +462,7 @@ if LibGroupTalents then
                 end
                 if not name then return end
                 local spec = SpecFromLibName(newSpec)
-                if spec and ApplySpec(name, spec) then
+                if spec and B:SetSpec(name, spec, "lib") then
                     B:RebuildBars()
                 end
             end)
@@ -416,8 +480,9 @@ specRescanFrame:SetScript("OnUpdate", function(self, el)
     local changed = false
     for name, p in pairs(B.paladins) do
         if p.unit == "player" then
-            local spec = ScanSpellbookForSpec() or GetPlayerSpecViaTalents()
-            if spec and ApplySpec(name, spec) then changed = true end
+            local spec, source = ScanSpellbookForSpec(), "spellbook"
+            if not spec then spec, source = GetPlayerSpecViaTalents(), "talent" end
+            if spec and B:SetSpec(name, spec, source) then changed = true end
         end
     end
     if changed then B:RebuildBars() end
@@ -481,7 +546,7 @@ local function TryProcessInspectedUnit(unit)
 
         pal.lastPoints = pts
         pal.lastInspect = GetTime()
-        local specChanged = ApplySpec(name, spec)
+        local specChanged = B:SetSpec(name, spec, "talent")
 
         if specChanged and B._debugInspect then
             DEFAULT_CHAT_FRAME:AddMessage("|cff00FF00PallyMaster spec CHANGE|r " .. name
@@ -760,11 +825,40 @@ function B:BuildAnnounceLines()
     return lines
 end
 
+-- ==================== ANNOUNCE QUEUE ====================
+-- В WoW есть антифлуд: если отправить несколько SendChatMessage подряд в одном
+-- кадре, часть сообщений теряется (в рейде обычно проходит 2-3, остальные
+-- пропадают). Поэтому строки объявления отправляются по одной с паузой.
+local sendQueue = {}
+local sendElapsed = 0
+local SEND_INTERVAL = { RAID_WARNING = 2.0, RAID = 1.0, PARTY = 1.0 }
+
+local sendFrame = CreateFrame("Frame")
+sendFrame:SetScript("OnUpdate", function(_, el)
+    if #sendQueue == 0 then return end
+    sendElapsed = sendElapsed + el
+    local msg = sendQueue[1]
+    if sendElapsed < msg.delay then return end
+    sendElapsed = 0
+    table.remove(sendQueue, 1)
+    SendChatMessage(msg.text, msg.channel)
+end)
+
+local function QueueChat(text, channel)
+    local delay = SEND_INTERVAL[channel] or 1.0
+    if #sendQueue == 0 then sendElapsed = delay end
+    sendQueue[#sendQueue + 1] = { text = text, channel = channel, delay = delay }
+end
+
 function B:Announce()
     if not self:AnyBuffAssigned() then return end
 
     local lines = self:BuildAnnounceLines()
     if #lines == 0 then return end
+
+    -- Новый анонс отменяет недоотправленные строки предыдущего.
+    wipe(sendQueue)
+    sendElapsed = 0
 
     local inRaid  = (GetNumRaidMembers()  > 0) or UnitExists("raid1")
     local inParty = (GetNumPartyMembers() > 0) or UnitExists("party1")
@@ -778,16 +872,14 @@ function B:Announce()
     end
 
     -- Авто: в рейде RW для лидера/помощника, иначе RAID/PARTY.
-    if inRaid and IsPlayerRaidLeaderOrAssistant() then
-        for _, line in ipairs(lines) do
-            SendChatMessage(line, "RAID_WARNING")
-        end
-        return
+    local channel
+    if inRaid then
+        channel = IsPlayerRaidLeaderOrAssistant() and "RAID_WARNING" or "RAID"
+    else
+        channel = "PARTY"
     end
-
-    local channel = inRaid and "RAID" or "PARTY"
     for _, line in ipairs(lines) do
-        SendChatMessage(line, channel)
+        QueueChat(line, channel)
     end
 end
 
@@ -809,10 +901,10 @@ function B:AnnounceTest()
 
     local plan
     if inRaid then
-        if canRW then plan = "RAID_WARNING, " .. #lines .. " lines instantly"
-        else plan = "RAID, " .. #lines .. " lines instantly" end
+        if canRW then plan = "RAID_WARNING, " .. #lines .. " lines, 2s apart"
+        else plan = "RAID, " .. #lines .. " lines, 1s apart" end
     elseif inParty then
-        plan = "PARTY, " .. #lines .. " lines instantly"
+        plan = "PARTY, " .. #lines .. " lines, 1s apart"
     else
         plan = "local chat"
     end
@@ -870,6 +962,8 @@ function B:ResetSpecCache()
     for _, p in pairs(B.paladins) do
         if p.unit ~= "player" then
             p.spec = nil
+            p.specSource = nil
+            p.pendingSpec, p.pendingCount = nil, 0
             p.lastInspect = nil
             p.lastPoints = nil
             inspectQueue[p.unit] = { attempts = 0, recheck = true }
@@ -894,7 +988,7 @@ function B:PrintDebug()
         .. "  specCache: " .. ccache)
     for name, p in pairs(B.paladins) do
         f(DEFAULT_CHAT_FRAME, "  " .. name .. " (" .. tostring(p.unit) .. ") -> "
-            .. tostring(p.spec))
+            .. tostring(p.spec) .. " [" .. tostring(p.specSource) .. "]")
     end
 end
 

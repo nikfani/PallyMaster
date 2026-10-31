@@ -8,7 +8,7 @@ local ADDON = "PallyMaster"
 local PM = {}
 _G[ADDON] = PM
 PM.ADDON = ADDON
-PM.version = "1.0.0"
+PM.version = "1.0.1"
 
 PM.modules = {}
 PM.order = {}
