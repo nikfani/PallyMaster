@@ -825,10 +825,38 @@ function B:BuildAnnounceLines()
     return lines
 end
 
--- ==================== ANNOUNCE QUEUE ====================
--- В WoW есть антифлуд: если отправить несколько SendChatMessage подряд в одном
--- кадре, часть сообщений теряется (в рейде обычно проходит 2-3, остальные
--- пропадают). Поэтому строки объявления отправляются по одной с паузой.
+-- ==================== ANNOUNCE MESSAGE ====================
+-- Объявление уходит одним сообщением: строки склеиваются через "; ".
+-- Несколько SendChatMessage подряд клиент съедает антифлудом (в рейде
+-- проходит 2-3, остальные пропадают), поэтому шлём один SendChatMessage.
+-- Лимит чата — 255 байт, кириллица занимает 2 байта на символ. Держимся
+-- 240 байт: в обычном рейде все паладины влезают, а если нет — остаток
+-- уйдёт следующим сообщением (редкий случай, страховка от обрезки).
+local MAX_CHAT_BYTES = 240
+local LINE_SEPARATOR = "; "
+
+local function PackAnnounce(lines)
+    local chunks = { "" }
+    for _, line in ipairs(lines) do
+        if #line > MAX_CHAT_BYTES then
+            local cut = line:sub(1, MAX_CHAT_BYTES - 3)
+            local sp = cut:match("^.*()%s")
+            if sp and sp > 1 then cut = cut:sub(1, sp - 1) end
+            line = cut .. "..."
+        end
+        local cur = chunks[#chunks]
+        local candidate = (cur == "") and line or (cur .. LINE_SEPARATOR .. line)
+        if #candidate <= MAX_CHAT_BYTES then
+            chunks[#chunks] = candidate
+        else
+            chunks[#chunks + 1] = line
+        end
+    end
+    if chunks[#chunks] == "" then table.remove(chunks) end
+    return chunks
+end
+
+-- Очередь нужна только для остатка, который не влез в лимит чата.
 local sendQueue = {}
 local sendElapsed = 0
 local SEND_INTERVAL = { RAID_WARNING = 2.0, RAID = 1.0, PARTY = 1.0 }
@@ -844,19 +872,15 @@ sendFrame:SetScript("OnUpdate", function(_, el)
     SendChatMessage(msg.text, msg.channel)
 end)
 
-local function QueueChat(text, channel)
-    local delay = SEND_INTERVAL[channel] or 1.0
-    if #sendQueue == 0 then sendElapsed = delay end
-    sendQueue[#sendQueue + 1] = { text = text, channel = channel, delay = delay }
-end
-
 function B:Announce()
     if not self:AnyBuffAssigned() then return end
 
     local lines = self:BuildAnnounceLines()
     if #lines == 0 then return end
 
-    -- Новый анонс отменяет недоотправленные строки предыдущего.
+    local chunks = PackAnnounce(lines)
+
+    -- Новый анонс отменяет недоотправленный остаток предыдущего.
     wipe(sendQueue)
     sendElapsed = 0
 
@@ -865,8 +889,8 @@ function B:Announce()
 
     -- Вне группы — только локальный чат.
     if not inRaid and not inParty then
-        for _, line in ipairs(lines) do
-            DEFAULT_CHAT_FRAME:AddMessage(ChatPrefix() .. ": " .. line)
+        for _, chunk in ipairs(chunks) do
+            DEFAULT_CHAT_FRAME:AddMessage(ChatPrefix() .. ": " .. chunk)
         end
         return
     end
@@ -878,8 +902,15 @@ function B:Announce()
     else
         channel = "PARTY"
     end
-    for _, line in ipairs(lines) do
-        QueueChat(line, channel)
+
+    -- Основное объявление — сразу и одним сообщением.
+    SendChatMessage(chunks[1], channel)
+    for i = 2, #chunks do
+        sendQueue[#sendQueue + 1] = {
+            text = chunks[i],
+            channel = channel,
+            delay = SEND_INTERVAL[channel] or 1.0,
+        }
     end
 end
 
@@ -889,6 +920,7 @@ function B:AnnounceTest()
         DEFAULT_CHAT_FRAME:AddMessage(ChatPrefix() .. " announcetest: buffs not assigned")
         return
     end
+    local chunks = PackAnnounce(lines)
     local inRaid  = (GetNumRaidMembers()  > 0) or UnitExists("raid1")
     local inParty = (GetNumPartyMembers() > 0) or UnitExists("party1")
     local canRW = IsPlayerRaidLeaderOrAssistant()
@@ -897,21 +929,22 @@ function B:AnnounceTest()
     DEFAULT_CHAT_FRAME:AddMessage("  inRaid=" .. tostring(inRaid)
         .. " inParty=" .. tostring(inParty)
         .. " canRW=" .. tostring(canRW)
-        .. " lines=" .. #lines)
+        .. " entries=" .. #lines
+        .. " messages=" .. #chunks)
 
     local plan
     if inRaid then
-        if canRW then plan = "RAID_WARNING, " .. #lines .. " lines, 2s apart"
-        else plan = "RAID, " .. #lines .. " lines, 1s apart" end
+        if canRW then plan = "RAID_WARNING, one message"
+        else plan = "RAID, one message" end
     elseif inParty then
-        plan = "PARTY, " .. #lines .. " lines, 1s apart"
+        plan = "PARTY, one message"
     else
         plan = "local chat"
     end
     DEFAULT_CHAT_FRAME:AddMessage("  channel: " .. plan)
 
-    for i, line in ipairs(lines) do
-        DEFAULT_CHAT_FRAME:AddMessage("  [" .. i .. "] (" .. #line .. "b) " .. line)
+    for i, chunk in ipairs(chunks) do
+        DEFAULT_CHAT_FRAME:AddMessage("  [" .. i .. "] (" .. #chunk .. "b) " .. chunk)
     end
 end
 
