@@ -258,6 +258,10 @@ local function BuildBuffsPage(page)
         { text = BL.bmShort, value = "short" },
         { text = BL.bmFull, value = "full" },
     }, function() return d.buffNameMode end, function(v) d.buffNameMode = v end, changed)
+    ry = ry - MakeDropdown(page, "announcelayout", BL.announceLayout, X2 + 8, ry, {
+        { text = BL.alLines, value = "lines" },
+        { text = BL.alSingle, value = "single" },
+    }, function() return d.announceLayout end, function(v) d.announceLayout = v end, changed)
     ry = ry - MakeDropdown(page, "announcenamemode", BL.announceNameMode, X2 + 8, ry, {
         { text = BL.anShort, value = "short" },
         { text = BL.anFull, value = "full" },

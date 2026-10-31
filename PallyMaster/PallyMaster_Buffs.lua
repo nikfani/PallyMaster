@@ -15,9 +15,12 @@ if GetLocale() == "ruRU" then
     L.buffNameMode = "Название баффа в меню"
     L.bmIcon = "Иконка"; L.bmShort = "Сокращение"; L.bmFull = "Полное название"
     L.announceNameMode = "Название баффа в объявлении"; L.anShort = "Сокращение"; L.anFull = "Полное название"
+    L.announceLayout = "Вид объявления"
+    L.alLines = "Построчно"; L.alSingle = "Одной строкой"
     L.assign = "Назначить бафф"; L.unassign = "Снять все назначения"; L.announce = "Объявить"
     L.noPaladins = "Нет паладинов в группе"; L.allAssigned = "Все баффы назначены"
     L.assignedTo = "%s: %s"
+    L.assignedToSingle = "%s - %s"
     L.proto = "Прото-бафф"
     L.specUnknown = "Неизв."; L.specHoly = "Свет"; L.specProt = "Защита"; L.specRet = "Воздаяние"
     L.shortKings = "Каска"; L.shortMight = "Кулак"; L.shortWisdom = "Крест"
@@ -33,6 +36,9 @@ else
     L.assign = "Assign buff"; L.unassign = "Unassign all"; L.announce = "Announce"
     L.noPaladins = "No paladins in group"; L.allAssigned = "All buffs assigned"
     L.assignedTo = "%s: %s"
+    L.assignedToSingle = "%s - %s"
+    L.announceLayout = "Announce layout"
+    L.alLines = "One line per paladin"; L.alSingle = "Single line"
     L.proto = "Proto-buff"
     L.specUnknown = "Unknown"; L.specHoly = "Holy"; L.specProt = "Protection"; L.specRet = "Retribution"
     L.shortKings = "Kings"; L.shortMight = "Might"; L.shortWisdom = "Wisdom"
@@ -232,6 +238,7 @@ function B:GetDefaults()
         menuDirection   = "right",
         buffNameMode    = "icon",
         announceNameMode = "short",
+        announceLayout  = "single",
         width           = 220,
         scale           = 1.0,
         spacing         = 4,
@@ -803,7 +810,7 @@ local function ChatPrefix()
     return "|cffFF7D0A" .. PM.ADDON .. "|r"
 end
 
-function B:BuildAnnounceLines()
+function B:BuildAnnounceEntries()
     local entries = {}
     for name in pairs(B.paladins) do
         local buffs = {}
@@ -817,25 +824,42 @@ function B:BuildAnnounceLines()
         end
     end
     table.sort(entries, function(a, b) return a.name < b.name end)
+    return entries
+end
+
+-- Режим «построчно»: одна строка на паладина, каждая уходит отдельным
+-- сообщением (с паузой, иначе антифлуд съест часть строк).
+function B:BuildAnnounceLines()
     local lines = {}
-    for _, entry in ipairs(entries) do
-        local line = string.format(L.assignedTo, entry.name, entry.text)
-        lines[#lines + 1] = SanitizeLine(line)
+    for _, entry in ipairs(self:BuildAnnounceEntries()) do
+        lines[#lines + 1] = SanitizeLine(string.format(L.assignedTo, entry.name, entry.text))
     end
     return lines
 end
 
+-- Режим «одной строкой»: одна запись на паладина, склеиваются через ", ".
+function B:BuildAnnounceSingleParts()
+    local parts = {}
+    for _, entry in ipairs(self:BuildAnnounceEntries()) do
+        parts[#parts + 1] = SanitizeLine(string.format(L.assignedToSingle, entry.name, entry.text))
+    end
+    return parts
+end
+
 -- ==================== ANNOUNCE MESSAGE ====================
--- Объявление уходит одним сообщением: строки склеиваются через "; ".
--- Несколько SendChatMessage подряд клиент съедает антифлудом (в рейде
--- проходит 2-3, остальные пропадают), поэтому шлём один SendChatMessage.
+-- «Одной строкой»: все записи склеиваются в один текст через ", " и
+-- отправляются одним SendChatMessage. «Построчно»: каждая строка — отдельное
+-- сообщение (см. B:Announce). Несколько SendChatMessage подряд клиент съедает
+-- антифлудом (в рейде проходит 2-3, остальные пропадают), поэтому всё, кроме
+-- первого сообщения, уходит из очереди с паузой.
 -- Лимит чата — 255 байт, кириллица занимает 2 байта на символ. Держимся
 -- 240 байт: в обычном рейде все паладины влезают, а если нет — остаток
 -- уйдёт следующим сообщением (редкий случай, страховка от обрезки).
 local MAX_CHAT_BYTES = 240
 local LINE_SEPARATOR = "; "
 
-local function PackAnnounce(lines)
+local function PackAnnounce(lines, separator)
+    separator = separator or LINE_SEPARATOR
     local chunks = { "" }
     for _, line in ipairs(lines) do
         if #line > MAX_CHAT_BYTES then
@@ -845,7 +869,7 @@ local function PackAnnounce(lines)
             line = cut .. "..."
         end
         local cur = chunks[#chunks]
-        local candidate = (cur == "") and line or (cur .. LINE_SEPARATOR .. line)
+        local candidate = (cur == "") and line or (cur .. separator .. line)
         if #candidate <= MAX_CHAT_BYTES then
             chunks[#chunks] = candidate
         else
@@ -856,7 +880,26 @@ local function PackAnnounce(lines)
     return chunks
 end
 
--- Очередь нужна только для остатка, который не влез в лимит чата.
+-- Режим объявления: "single" (по умолчанию) — всё одной строкой,
+-- "lines" — по строке на паладина. Неизвестное значение считаем "single".
+function B:GetAnnounceLayout()
+    local mode = self.db and self.db.announceLayout
+    if mode ~= "lines" then mode = "single" end
+    return mode
+end
+
+-- Возвращает готовый список сообщений к отправке.
+function B:BuildAnnounceMessages()
+    if self:GetAnnounceLayout() == "lines" then
+        return self:BuildAnnounceLines()
+    end
+    -- PackAnnounce склеивает записи через ", " и при нехватке места режет
+    -- по границам записей, чтобы ничего не потерять.
+    return PackAnnounce(self:BuildAnnounceSingleParts(), ", ")
+end
+
+-- Очередь нужна для режима «построчно» и для остатка, который не влез
+-- в лимит чата.
 local sendQueue = {}
 local sendElapsed = 0
 local SEND_INTERVAL = { RAID_WARNING = 2.0, RAID = 1.0, PARTY = 1.0 }
@@ -875,10 +918,8 @@ end)
 function B:Announce()
     if not self:AnyBuffAssigned() then return end
 
-    local lines = self:BuildAnnounceLines()
-    if #lines == 0 then return end
-
-    local chunks = PackAnnounce(lines)
+    local messages = self:BuildAnnounceMessages()
+    if #messages == 0 then return end
 
     -- Новый анонс отменяет недоотправленный остаток предыдущего.
     wipe(sendQueue)
@@ -889,8 +930,8 @@ function B:Announce()
 
     -- Вне группы — только локальный чат.
     if not inRaid and not inParty then
-        for _, chunk in ipairs(chunks) do
-            DEFAULT_CHAT_FRAME:AddMessage(ChatPrefix() .. ": " .. chunk)
+        for _, msg in ipairs(messages) do
+            DEFAULT_CHAT_FRAME:AddMessage(ChatPrefix() .. ": " .. msg)
         end
         return
     end
@@ -903,11 +944,13 @@ function B:Announce()
         channel = "PARTY"
     end
 
-    -- Основное объявление — сразу и одним сообщением.
-    SendChatMessage(chunks[1], channel)
-    for i = 2, #chunks do
+    -- Первое сообщение уходит сразу. В режиме «одной строкой» оно обычно
+    -- единственное; в режиме «построчно» остальные идут по очереди, иначе
+    -- антифлуд выбросит часть строк.
+    SendChatMessage(messages[1], channel)
+    for i = 2, #messages do
         sendQueue[#sendQueue + 1] = {
-            text = chunks[i],
+            text = messages[i],
             channel = channel,
             delay = SEND_INTERVAL[channel] or 1.0,
         }
@@ -915,12 +958,12 @@ function B:Announce()
 end
 
 function B:AnnounceTest()
-    local lines = self:BuildAnnounceLines()
-    if #lines == 0 then
+    local messages = self:BuildAnnounceMessages()
+    if #messages == 0 then
         DEFAULT_CHAT_FRAME:AddMessage(ChatPrefix() .. " announcetest: buffs not assigned")
         return
     end
-    local chunks = PackAnnounce(lines)
+    local layout = self:GetAnnounceLayout()
     local inRaid  = (GetNumRaidMembers()  > 0) or UnitExists("raid1")
     local inParty = (GetNumPartyMembers() > 0) or UnitExists("party1")
     local canRW = IsPlayerRaidLeaderOrAssistant()
@@ -929,22 +972,22 @@ function B:AnnounceTest()
     DEFAULT_CHAT_FRAME:AddMessage("  inRaid=" .. tostring(inRaid)
         .. " inParty=" .. tostring(inParty)
         .. " canRW=" .. tostring(canRW)
-        .. " entries=" .. #lines
-        .. " messages=" .. #chunks)
+        .. " layout=" .. layout
+        .. " messages=" .. #messages)
 
     local plan
     if inRaid then
-        if canRW then plan = "RAID_WARNING, one message"
-        else plan = "RAID, one message" end
+        if canRW then plan = "RAID_WARNING"
+        else plan = "RAID" end
     elseif inParty then
-        plan = "PARTY, one message"
+        plan = "PARTY"
     else
         plan = "local chat"
     end
     DEFAULT_CHAT_FRAME:AddMessage("  channel: " .. plan)
 
-    for i, chunk in ipairs(chunks) do
-        DEFAULT_CHAT_FRAME:AddMessage("  [" .. i .. "] (" .. #chunk .. "b) " .. chunk)
+    for i, msg in ipairs(messages) do
+        DEFAULT_CHAT_FRAME:AddMessage("  [" .. i .. "] (" .. #msg .. "b) " .. msg)
     end
 end
 
