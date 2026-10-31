@@ -1,0 +1,16 @@
+## Interface: 30300
+## Title: PallyMaster
+## Notes: Ауры паладинов и назначение баффов в одном аддоне
+## Author: Nikol
+## Version: 1.0.0
+## SavedVariables: PallyMasterDB
+
+Libs\LibStub\LibStub.lua
+Libs\CallbackHandler-1.0\CallbackHandler-1.0.lua
+Libs\LibTalentQuery-1.0\LibTalentQuery-1.0.lua
+Libs\LibGroupTalents-1.0\lib.xml
+PallyMaster.lua
+PallyMaster_Auras.lua
+PallyMaster_Buffs.lua
+PallyMaster_Buffs_UI.lua
+PallyMaster_Config.lua
